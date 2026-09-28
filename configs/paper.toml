@@ -1,0 +1,11 @@
+symbol = "BTCUSDT"
+database = "data/paper.sqlite3"
+initial_cash = "10000"
+max_notional = "100"
+max_daily_loss = "20"
+max_spread_bps = "10"
+taker_fee_bps = "5"
+slippage_bps = "2"
+latency_ms = 100
+stale_ms = 2000
+kill_file = "data/KILL"

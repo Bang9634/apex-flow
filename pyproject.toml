@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "apex-flow"
+version = "0.1.0"
+description = "Read-only Binance Futures collection and local paper execution"
+requires-python = ">=3.12"
+dependencies = ["websockets>=15,<17"]
+
+[project.scripts]
+apex-flow = "apex_flow.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
