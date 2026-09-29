@@ -2,23 +2,31 @@
 
 ## 읽는 순서와 전체 흐름
 
-`config.py → market.py → storage.py → paper.py → collector.py → cli.py → tests` 순으로 읽으면
+`clock.py → config.py → market.py → storage.py → paper.py → observability/ → collector.py → runtime.py → cli.py → tests` 순으로 읽으면
 설정·자료 구조·회계 규칙을 먼저 이해한 뒤 비동기 실행을 볼 수 있다.
 
 ```text
 python -m apex_flow
   __main__.py → cli.main()
     Config.load() → Store 생성
-    demo: synthetic() → Market.apply() → Paper.submit()/step()
-    collect/paper: cli.live() → collector.run_collector()
+    demo: demo.synthetic() → Market.apply() → Paper.submit()/step()
+    collect/paper: runtime.run_market_session() → collector.run_collector()
       WebSocket 수신 → Store.event() → Market.apply() → on_event()
       heartbeat ────────────────────────────────────→ on_event()
         Paper.step() → 필요 시 검사 주문/청산 submit() → 상태 출력
-    종료 → 대기 가상 주문 취소 → DB/연결 정리
+      계측 메모리 집계 → 주기적인 JSONL 보고서
+    종료 → 대기 가상 주문 취소 → final 계측 보고서 → DB/연결 정리
 ```
 
 새로 submit한 주문은 같은 콜백에서 즉시 체결하지 않는다. 다음 step이 시간·새 호가 조건을 확인한다.
-`live()`라는 이름은 실시간 시세를 뜻한다. 실자금 거래 함수가 아니다.
+실시간 시세와 가상 주문을 처리하며 실자금 거래 함수는 없다.
+
+## clock.py — 두 종류의 시간
+
+`TimePoint`는 UTC 표시용 `wall_ms`와 경과 시간용 `mono_ns`를 함께 전달한다.
+`elapsed_ms()`는 monotonic 차이를 계산하므로 PC 시계가 앞으로/뒤로 보정되어도
+보유 시간이나 가상 주문 지연이 갑자기 바뀌지 않는다. `SystemClock` 대신 테스트 시계를 주입할 수 있다.
+UTC는 거래소 이벤트 시각과의 비교·일일 회계 날짜에 여전히 사용하며 자동 시각 동기화는 하지 않는다.
 
 ## config.py — 설정과 검증
 
@@ -34,7 +42,7 @@ python -m apex_flow
 ## market.py — 메모리상의 시장 상태와 지표
 
 `Market`은 bids/asks, mark, 최근 100개 가격·거래 방향 표본, 연결 상태를 보유한다.
-`last`는 이벤트 유형별 `(수신 시각, 거래소 이벤트 시각)`이다. `default_factory`는
+`last`는 이벤트 유형별 `(수신 TimePoint, 거래소 이벤트 wall_ms)`이다. `default_factory`는
 Market 인스턴스들이 리스트·딕셔너리를 공유하지 않도록 한다.
 
 `apply()`의 흐름:
@@ -49,6 +57,8 @@ Market 인스턴스들이 리스트·딕셔너리를 공유하지 않도록 한�
 `book_healthy()`는 청산 체결용으로 public 연결과 최신 호가를 요구한다.
 `disconnect()`는 해당 피드의 유효성을 제거한다. mark 값 자체는 남을 수 있으므로
 mark 숫자가 존재한다는 것만으로 최신이라고 판단하면 안 된다.
+`fresh()`는 수신 당시의 이벤트 나이와 이후 monotonic 경과를 함께 검사한다.
+오래 걸려 도착한 이벤트를 새 데이터로 취급하지 않고, UTC가 뒤로 바뀌어도 기존 데이터가 다시 신선해지지 않는다.
 
 `features()`:
 
@@ -83,8 +93,10 @@ with store.db:
 중간에 예외가 나면 두 변경이 함께 롤백된다. DB 커밋 뒤에 메모리 계좌를 바꿔 일관성을 유지한다.
 WAL/FULL은 저장 내구성을 위한 설정이며 비동기 저장을 의미하지 않는다.
 
-리뷰: `orders`는 상태 이력을 덮어쓴다. append-only 주문 이벤트, 스키마 버전,
-실행 메타데이터, 저장 성능 관측을 추가해야 한다. 읽기 전용 status 연결도 개선 후보다.
+리뷰: `orders`는 상태 이력을 덮어쓴다. append-only 주문 이벤트와
+정식 스키마 버전 관리가 필요하다. 이번에는 기존 events에 nullable `received_mono_ns`와
+`run_id` 컬럼을 호환 추가했다. 기존 데이터는 보존하며 실행 메타데이터/저장 시간은 JSONL에 기록한다.
+읽기 전용 status 연결도 개선 후보다.
 
 ## paper.py — 가상 주문, 위험 검사, 회계
 
@@ -105,6 +117,9 @@ CANCELLED로 바꾼다. 이는 가상 주문에만 맞는 정책이며 실제 �
 5. BUY는 ask, SELL은 bid 수량을 순서대로 소진하고 추가 슬리피지를 적용한다.
 6. 체결 수량/금액/수수료와 새 계좌를 계산한다.
 7. 계좌와 주문 결과를 함께 커밋한 후 메모리 상태를 갱신한다.
+
+주문 대기·만료와 새 호가 도착 비교는 monotonic을 사용한다. 체결 결과의 `simulated_wait_ms`는
+로컬 가상 체결까지의 대기 시간이며 실제 거래소의 주문 지연이 아니다.
 
 미체결 잔량은 재대기시키지 않는 IOC 근사다. 같은 호가 ID를 연이어 소진하지 않도록 하지만,
 다음 스냅샷의 유동성이 완전히 새것이라는 근사는 남아 있다.
@@ -131,31 +146,53 @@ spread는 bid/ask 체결 가격에 이미 반영되어 있다. 비용으로 다�
 ## collector.py — 비동기 수신과 장애 처리
 
 `stream_urls()`는 public 호가와 market 체결/mark를 별도 URL로 만든다.
-`collect_group()`는 메시지를 받고 원본 저장 → 시장 반영 → CLI 콜백 순으로 처리한다.
+`collect_group()`는 메시지를 받고 원본 저장 → 시장 반영 → runtime 콜백 순으로 처리한다.
 내부 파싱/저장/콜백 오류는 RuntimeError로 전달해 통신 오류 재시도와 구분한다.
 네트워크 오류는 backoff+jitter로 재시도하고 연속 8회 실패 시 중단한다.
 성공적으로 메시지를 처리하면 실패 횟수는 초기화된다. 전체 장애 횟수 누계가 아니다.
 
 `run_collector()`는 TaskGroup으로 두 연결을 실행하고, 약 250ms heartbeat를 호출한다.
-한 작업의 치명적 예외는 다른 작업도 중단시킨다. 종료 deadline은 monotonic clock을 쓰지만
-주문 지연과 freshness에 전달되는 `now_ms()`는 wall clock이다.
+한 작업의 치명적 예외는 다른 작업도 중단시킨다. 종료 deadline과 heartbeat 지연은 monotonic으로
+계산하고, 콜백에는 TimePoint를 전달한다. 저장 직후 현재 시간을 다시 읽으므로 DB가 느릴 때
+수신 당시의 오래된 시각으로 주문의 freshness를 검사하지 않는다.
+
+수신 나이·메시지 간격·payload 바이트·연결/RTT와 parse/persist/market/callback/total 시간을
+구분해 기록한다. 거래소 이벤트 UTC와 PC UTC의 차이는 시계 오차도 포함하며 순수 통신 시간은 아니다.
 
 리뷰: asyncio는 외부 대기 시간을 겹칠 수 있게 할 뿐 동기 DB 쓰기를 병렬화하지 않는다.
-서버 메시지 갭, 큐 지연, 데이터 지연 분포, 장시간 재접속 정책을 계측/보완해야 한다.
+서버 메시지 갭, 내부 큐 대기와 네트워크의 분리, 장시간 재접속 정책은 추가 보완이 필요하다.
 
-## cli.py — 명령과 모듈 조립
+## runtime.py — 실행 조립과 생명주기
 
-`main()`은 argparse 검증, 설정 로딩, DB 출처 확인과 실행/종료를 담당한다.
-`synthetic()`와 `demo()`는 합성 이벤트로 회계를 검사한다.
-`live()`는 collect에서는 계좌 없이 수집하고 paper에서는 계좌를 복구한다.
+`SessionOptions`는 argparse와 독립된 실행 설정이다. `run_market_session()`은 시계·계측·시장·가상
+계좌·보고서를 조립하고 수집 작업과 보고서 작업의 종료/오류를 함께 관리한다.
 안쪽 `on_event()`는 step을 먼저 실행하고, 이후 명시적 검사 주문/청산을 요청한다.
 `nonlocal`은 콜백이 바깥 함수의 제출 여부/시간/출력 시각을 갱신하도록 한다.
 
 `opened_at`은 이름과 달리 매수 요청 시각이다. 현재 hold_seconds는 체결 후 보유 시간이 아니다.
-기본 paper에는 전략·자동 손절이 없다. `finally`는 정상 종료/예외 모두에서 대기 주문을 취소한다.
+기본 paper에는 전략·자동 손절이 없다. `finally`는 정상 종료/예외 모두에서 대기 주문을 취소하고
+최종 계측 보고서 기록을 시도한다. 보고서 쓰기는 thread에서 실행해 동기 파일 쓰기로 루프를 막지 않는다.
 
-리뷰: 전략이 생기면 CLI 콜백에 계속 분기를 추가하지 말고 별도 실행 조정 모듈로 분리한다.
-출력은 현재 DB의 JSON 문자열을 포함하므로 읽기 편한 로그/보고서로 바꿀 여지가 있다.
+리뷰: 전략이 생기면 이 콜백에 전략별 분기를 계속 넣지 말고 독립적인 전략·위험 모듈을 호출한다.
+출력은 현재 DB의 JSON 문자열을 포함하므로 읽기 편한 주문 로그로 바꿀 여지가 있다.
+
+## observability/ — 집계와 출력의 분리
+
+`metrics.py`는 제한된 개수의 최근 표본으로 p50/p95/p99를 계산하고, 실행 전체의 count/mean/min/max는
+별도로 유지한다. 연결 장애 중 메시지가 없어도 snapshot에서 down 시간을 계산한다.
+`check_clock()`은 UTC 변화와 monotonic 변화의 차이가 250ms를 넘으면 시계 점프를 기록한다.
+
+`reporting.py`는 실행별 새 JSONL 파일에 메타데이터·주기 집계·최종 집계를 쓴다.
+기존 파일은 덮어쓰지 않으며, 취소 시 이미 시작된 thread 쓰기를 기다려 final과 순서가 섞이지 않게 한다.
+관측이 없는 RTT를 0으로 만들지 않는다. 상세 의미와 한계는 [metrics.md](metrics.md)를 참조한다.
+
+## cli.py / demo.py — 진입점과 합성 예제
+
+`main()`은 argparse 검증, 설정 로딩, DB 출처 확인과 실행/종료를 담당한다.
+CLI는 runtime의 SessionOptions를 구성하며 실행 정책을 직접 구현하지 않는다.
+`demo.py`의 `synthetic()`와 `demo()`는 합성 이벤트로 회계를 검사한다.
+`point()`는 합성 밀리초 값을 TimePoint로 바꾸는 예제/테스트용 함수이며 실측 UTC와 monotonic을
+동일시하는 운영용 시계로 쓰면 안 된다. demo는 WebSocket 연결 없이 실행할 수 있다.
 
 ## 나머지 파일
 
@@ -165,13 +202,16 @@ spread는 bid/ask 체결 가격에 이미 반영되어 있다. 비용으로 다�
 | __init__.py | 패키지 설명. 실행 로직 없음 |
 | tests/test_core.py | 회계·중복 ID·위험·부분 체결·복구·트랜잭션 롤백·날짜 경계 검증 |
 | tests/test_collector.py | URL 분리, 메시지 없는 heartbeat, 내부 오류 재시도 금지 |
-| tests/test_cli.py | 기존 포지션 복구 후 market 피드 없이 최신 호가로 청산하는 CLI 통합 검증 |
+| tests/test_cli.py | 기존 포지션 복구 후 market 피드 없이 최신 호가로 청산하는 runtime 통합 검증 |
+| tests/test_metrics.py | 시계 역행·지연 저장·표본 집계·DB 호환·통신 오류·종료/취소 보고서 검증 |
 | configs/paper.toml | 기본 비용/위험 가정. 실제 계정 수수료 조회 결과가 아님 |
 | pyproject.toml | Python 버전/의존성 범위, src 패키지 탐색, apex-flow 명령 등록. 완전한 lockfile은 아님 |
 | .gitignore | 키 파일·가상환경·DB 등을 Git에서 제외. 비밀정보 보호 전체를 보장하는 기능은 아님 |
 | data/.gitkeep, logs/.gitkeep | 빈 디렉터리 보존용. 실행 로직 없음 |
 | README.md | 시작 안내와 구현 범위 |
 | docs/design.md | 구조·상태 일관성·기대값 가정 |
+| docs/architecture.md | 현재 구조 평가, 의존 방향, 향후 확장 위치와 분리 기준 |
+| docs/metrics.md | 계측 실행법, 지표 정의, 시간 모델과 관측 한계 |
 | docs/review.md | 우선순위별 결함/한계와 수정 기록 |
 | docs/roadmap.md | 다음 개발 단계와 완료 조건 |
 | docs/validation.md | 실제 수행한 검증과 하지 않은 검증의 구분 |

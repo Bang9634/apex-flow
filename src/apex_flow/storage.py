@@ -8,6 +8,7 @@ import fcntl
 class Store:
     """원본 이벤트와 paper 상태를 저장한다. put/save_order의 커밋은 호출자가 책임진다."""
     def __init__(self, path: str):
+        self.path = Path(path).resolve()
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         # Advisory exclusive lock prevents two engines from spending the same cash.
         self.lock = open(str(Path(path).resolve()) + ".lock", "a")
@@ -31,11 +32,19 @@ class Store:
                 status TEXT NOT NULL, result TEXT NOT NULL);
         ''')
 
-    def event(self, stream, payload, received_ms):
+        # 기존 프로토타입 DB의 이벤트는 보존하고 새 컬럼만 nullable로 추가한다.
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(events)")}
+        with self.db:
+            if "received_mono_ns" not in columns:
+                self.db.execute("ALTER TABLE events ADD COLUMN received_mono_ns INTEGER")
+            if "run_id" not in columns:
+                self.db.execute("ALTER TABLE events ADD COLUMN run_id TEXT")
+
+    def event(self, stream, payload, received_ms, *, received_mono_ns=None, run_id=None):
         """수신 이벤트 한 건을 자체 트랜잭션으로 저장한다. 원본의 중복도 보존한다."""
         with self.db:
-            self.db.execute("INSERT INTO events(received_ms,stream,payload) VALUES(?,?,?)",
-                            (received_ms, stream, json.dumps(payload, separators=(",", ":"))))
+            self.db.execute("INSERT INTO events(received_ms,stream,payload,received_mono_ns,run_id) VALUES(?,?,?,?,?)",
+                            (received_ms, stream, json.dumps(payload, separators=(",", ":")), received_mono_ns, run_id))
 
     def get(self, key, default=None):
         """JSON 상태를 복원한다. 키가 없으면 default를 반환한다."""

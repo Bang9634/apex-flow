@@ -6,6 +6,7 @@ Python 3.12+ 기반 Binance USDⓈ-M 공개 데이터 수집기와 **로컬 pape
 
 자세한 사용법은 [실행 안내](docs/runbook.md), 함수별 설명과 검토는
 [소스코드 해설](docs/code-walkthrough.md)을 참조하세요.
+[아키텍처](docs/architecture.md)와 [계측 안내](docs/metrics.md)에 확장 경계와 측정값 해석을 정리했습니다.
 
 ## 시작
 
@@ -45,6 +46,17 @@ python3 -m venv .venv
 이미 체결된 가상 포지션은 저장합니다. 데이터가 끊긴 상태에서 가짜 청산을 기록하지 않습니다.
 재시작 후 `--close-position`으로 잔여 포지션의 청산을 시도할 수 있습니다.
 동일 DB를 사용하는 두 프로세스는 동시에 실행할 수 없습니다. 수집과 paper의 별도 동시 실행은 서로 다른 DB를 사용하세요.
+
+## 계측 실행
+
+```sh
+PYTHONPATH=src .venv/bin/python -m apex_flow collect --seconds 60 --metrics-interval 10
+```
+
+`collect`/`paper`는 기본적으로 `logs/metrics-<run-id>.jsonl`을 생성합니다.
+도착 나이·처리/DB 지연·루프 지연·연결 상태·WebSocket RTT를 기록합니다.
+도착 나이는 시계 오차를 포함하며 RTT는 실주문 지연이 아닙니다.
+백분위수는 지표별 최근 최대 4096개 표본 기준입니다. 실행 시간은 여전히 최대 24시간입니다.
 
 ## 현재 구현
 

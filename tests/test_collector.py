@@ -5,6 +5,8 @@ import unittest
 from unittest.mock import patch
 
 from apex_flow.collector import collect_group, run_collector, stream_urls
+from apex_flow.clock import SystemClock
+from apex_flow.observability.metrics import Metrics
 from apex_flow.config import Config
 from apex_flow.market import Market
 
@@ -24,8 +26,9 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 stopped.append(group)
 
+        clock = SystemClock()
         with patch("apex_flow.collector.collect_group", worker):
-            await run_collector(Config(), Market("BTCUSDT"), None, ticks.append, 0.02)
+            await run_collector(Config(), Market("BTCUSDT"), None, ticks.append, 0.02, clock, Metrics(clock), "test")
         self.assertTrue(ticks)
         self.assertEqual(set(stopped), {"public", "market"})
 
@@ -33,6 +36,7 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
 class ProcessingFailureTests(unittest.IsolatedAsyncioTestCase):
     async def test_callback_oserror_is_fatal_not_network_retry(self):
         class Socket:
+            latency = 0
             async def __aenter__(self):
                 return self
 
@@ -47,11 +51,12 @@ class ProcessingFailureTests(unittest.IsolatedAsyncioTestCase):
 
         market, store = Mock(), Mock()
         market.connected = set()
+        clock = SystemClock()
         callback = Mock(side_effect=OSError("internal disk failure"))
         with patch("apex_flow.collector.connect", return_value=Socket()) as connect, \
                 patch("apex_flow.collector.asyncio.sleep", new_callable=AsyncMock):
             with self.assertRaises(RuntimeError) as raised:
-                await collect_group("public", "unused", market, store, callback)
+                await collect_group("public", "unused", market, store, callback, clock, Metrics(clock), "test")
         self.assertIsInstance(raised.exception.__cause__, OSError)
         self.assertEqual(connect.call_count, 1)
         self.assertEqual(callback.call_count, 1)

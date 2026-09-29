@@ -3,6 +3,8 @@ from datetime import datetime, timezone
 from decimal import Decimal as D
 import json
 
+from .clock import TimePoint
+
 
 class Paper:
     """한 계좌·한 종목·대기 주문 하나를 처리하는 로컬 가상 엔진. 실주문을 보내지 않는다."""
@@ -24,10 +26,10 @@ class Paper:
         self.used_book = -1
         self.daily = store.get("daily")
 
-    def submit(self, client_id, side, quantity, now_ms, reduce_only=False):
+    def submit(self, client_id, side, quantity, now: TimePoint, reduce_only=False):
         """요청을 PENDING으로 기록한다. 체결은 이후 step에서 일어난다.
 
-        quantity는 기초자산 수량이고 now_ms는 로컬 wall-clock ms다.
+        quantity는 기초자산 수량이고 now는 UTC/monotonic 시각 쌍이다.
         같은 ID/직렬화된 요청은 기존 결과를 반환하며 다른 요청은 거절한다.
         """
         quantity = D(str(quantity))
@@ -46,8 +48,8 @@ class Paper:
         if self.pending:
             raise ValueError("Only one pending order allowed")
         with self.store.db:
-            self.store.save_order(client_id, request, "PENDING", {"submitted_ms": now_ms})
-        self.pending = (client_id, request, now_ms)
+            self.store.save_order(client_id, request, "PENDING", {"submitted_ms": now.wall_ms})
+        self.pending = (client_id, request, now)
         return self.store.order(client_id)
 
     def cancel(self, reason="cancelled"):
@@ -64,7 +66,7 @@ class Paper:
         price = market.mark or (market.bids[0][0] if market.bids else D(0))
         return D(self.account["cash"]) + q * price
 
-    def step(self, market, now_ms):
+    def step(self, market, now: TimePoint):
         """날짜 기준을 갱신하고 대기 주문을 한 번 진행한다.
 
         아직 처리할 수 없으면 None, 종료되면 저장된 주문을 반환한다.
@@ -72,7 +74,7 @@ class Paper:
         """
         # Roll before ANY fill (including a next-day SELL), even on idle heartbeats.
         # This is realized-change + full open PnL, not midnight equity accounting.
-        day = datetime.fromtimestamp(now_ms / 1000, timezone.utc).date().isoformat()
+        day = datetime.fromtimestamp(now.wall_ms / 1000, timezone.utc).date().isoformat()
         if not self.daily or self.daily["day"] != day:
             daily = {"day": day, "realized": self.account["realized"]}
             with self.store.db:
@@ -81,15 +83,15 @@ class Paper:
         if not self.pending:
             return None
         client_id, request, submitted = self.pending
-        if now_ms < submitted + self.config.latency_ms:
+        if now.elapsed_ms(submitted) < self.config.latency_ms:
             return None
         # Require a snapshot observed after simulated arrival. No same-tick fills.
         # 위험을 줄이는 매도는 trade/mark 장애와 분리하되, 최신 호가는 반드시 요구한다.
         healthy = market.book_healthy if request["reduce_only"] else market.healthy
-        if not healthy(now_ms, self.config.stale_ms):
+        if not healthy(now, self.config.stale_ms):
             return self._finish("REJECTED", {"reason": "unhealthy or stale market"})
-        if market.last["depthUpdate"][0] <= submitted + self.config.latency_ms or market.update_id <= self.used_book:
-            if now_ms - submitted > self.config.stale_ms:
+        if market.last["depthUpdate"][0].elapsed_ms(submitted) <= self.config.latency_ms or market.update_id <= self.used_book:
+            if now.elapsed_ms(submitted) > self.config.stale_ms:
                 return self._finish("EXPIRED", {"reason": "no fresh executable snapshot"})
             return None
         side = request["side"]
@@ -136,7 +138,7 @@ class Paper:
         # JSON에는 Decimal을 문자열로 기록해 float 변환에 따른 회계 오차를 피한다.
         account = dict(cash=str(cash), quantity=str(new_qty), basis=str(basis), realized=str(realized))
         result = dict(filled=str(filled), unfilled=str(D(request["quantity"])-filled),
-                      average_price=str(notional/filled), fee=str(fee), book_id=market.update_id, time_ms=now_ms)
+                      average_price=str(notional/filled), fee=str(fee), book_id=market.update_id, time_ms=now.wall_ms, simulated_wait_ms=now.elapsed_ms(submitted))
         status = "FILLED" if filled == D(request["quantity"]) else "PARTIAL_CANCELLED"
         # Position and fill are one transaction; a crash cannot persist only one.
         with self.store.db:

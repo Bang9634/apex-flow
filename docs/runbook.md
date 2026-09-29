@@ -29,7 +29,7 @@ source .venv/bin/activate
 PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
 ```
 
-현재 25개 테스트다. 외부 Binance 연결 없이 가상 계좌·장애 처리·CLI 연결 흐름을 검사한다.
+현재 38개 테스트다. 외부 Binance 연결 없이 가상 계좌·장애 처리·CLI 연결 흐름을 검사한다.
 테스트 통과는 전략 수익성 또는 실주문 안정성 증거가 아니다.
 
 ## 3. 오프라인 demo
@@ -174,3 +174,10 @@ PYTHONPATH=src .venv/bin/python -m apex_flow paper --seconds 60 > logs/paper-ses
 설치는 성공했지만 import 오류가 나면 `PYTHONPATH=src`를 사용하거나,
 macOS의 해당 `.pth` 파일 hidden 속성을 확인/해제한다. [README의 해결 절차](../README.md#설치-경로-문제-해결).
 가상환경 전체를 삭제할 필요는 없다. 다른 디렉터리에서 실행하면 src/config 경로를 찾지 못할 수 있다.
+
+
+## 11. 자동 계측
+
+collect/paper에는 계측이 기본 적용된다. `--metrics-output`과 `--metrics-interval`로
+출력 파일과 주기를 지정한다. [계측 안내](metrics.md)에서 전체 명령과 단위를 확인한다.
+이전 DB는 events의 nullable 컬럼 두 개를 추가하며 기존 계좌/이벤트는 유지한다.

@@ -5,6 +5,8 @@ from decimal import Decimal
 import math
 import statistics
 
+from .clock import TimePoint
+
 D = Decimal
 
 
@@ -18,7 +20,7 @@ def positive(value):
 
 @dataclass
 class Market:
-    """메모리의 시장 상태. last는 이벤트별 (로컬 수신 ms, 거래소 이벤트 ms)다."""
+    """메모리의 시장 상태. last는 이벤트별 (수신 TimePoint, 거래소 이벤트 ms)다."""
     symbol: str
     bids: list = field(default_factory=list)
     asks: list = field(default_factory=list)
@@ -43,13 +45,13 @@ class Market:
             self.prices.clear()
             self.flows.clear()
 
-    def apply(self, stream, event, now_ms):
+    def apply(self, stream, event, now: TimePoint):
         """이벤트를 검증·적용하면 True, 대상 밖/중복이면 False, 잘못된 값이면 예외다."""
         if event.get("s") != self.symbol or event.get("st", 1) != 1:
             return False
         kind = event.get("e")
         timestamp = int(event["E"])
-        if timestamp > now_ms + 1000 or timestamp < 0:
+        if timestamp > now.wall_ms + 1000 or timestamp < 0:
             raise ValueError("Invalid exchange event time / clock skew")
         if kind in self.last and timestamp < self.last[kind][1]:
             return False
@@ -82,23 +84,29 @@ class Market:
             self.mark = positive(event["p"])
         else:
             return False
-        self.last[kind] = (now_ms, timestamp)
+        self.last[kind] = (now, timestamp)
         return True
 
-    def book_healthy(self, now_ms, stale_ms):
-        """Executable quotes only; exits must not depend on unrelated trade/mark feeds."""
+    def fresh(self, kind, now: TimePoint, stale_ms):
+        if kind not in self.last:
+            return False
+        received, event_ms = self.last[kind]
+        elapsed = now.elapsed_ms(received)
+        # 수신 때 추정한 이벤트 나이에 monotonic 경과 시간을 더한다.
+        # UTC 시계가 뒤로 움직여도 오래된 데이터가 다시 fresh로 바뀌지 않는다.
+        arrival_age = received.wall_ms - event_ms
+        return (0 <= elapsed <= stale_ms and -1000 <= arrival_age <= stale_ms
+                and arrival_age + elapsed <= stale_ms)
+
+    def book_healthy(self, now: TimePoint, stale_ms):
+        """위험 축소 체결에는 최신 public 호가를 요구한다."""
         return ("public" in self.connected and bool(self.bids and self.asks)
-                and "depthUpdate" in self.last
-                and all(-1000 <= now_ms - t <= stale_ms for t in self.last["depthUpdate"]))
+                and self.fresh("depthUpdate", now, stale_ms))
 
-    def healthy(self, now_ms, stale_ms):
-        """신규 진입 조건. 두 연결과 세 이벤트가 모두 최신이어야 한다.
-
-        수신 시각만 검사하면 지연 도착한 과거 데이터를 최신으로 오인한다.
-        현재는 wall clock 기반이며 미래 시각에 1초 여유를 둔다.
-        """
+    def healthy(self, now: TimePoint, stale_ms):
+        """신규 진입은 두 연결과 세 종류의 최신 데이터가 필요하다."""
         return (self.connected == {"public", "market"} and bool(self.bids and self.asks)
-                and all(kind in self.last and all(-1000 <= now_ms - t <= stale_ms for t in self.last[kind])
+                and all(self.fresh(kind, now, stale_ms)
                         for kind in ("depthUpdate", "aggTrade", "markPriceUpdate")))
 
     def features(self):

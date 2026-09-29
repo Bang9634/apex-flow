@@ -1,11 +1,11 @@
-import argparse
 from decimal import Decimal
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from apex_flow.cli import live, synthetic
+from apex_flow.runtime import SessionOptions, run_market_session as live
+from apex_flow.demo import synthetic, point
 from apex_flow.config import Config
 from apex_flow.market import Market
 from apex_flow.paper import Paper
@@ -23,22 +23,23 @@ class ClosePositionTests(unittest.IsolatedAsyncioTestCase):
                 now = 1_800_000_000_000
                 synthetic(market, store, now, 1)
                 paper = Paper(config, store)
-                paper.submit("initial-buy", "BUY", "0.5", now)
+                paper.submit("initial-buy", "BUY", "0.5", point(now))
                 synthetic(market, store, now + 101, 2)
-                paper.step(market, now + 101)
+                paper.step(market, point(now + 101))
                 self.assertEqual(Decimal(paper.account["quantity"]), Decimal("0.5"))
 
-                async def fake_collector(config, market, store, on_event, duration):
+                async def fake_collector(config, market, store, on_event, duration, clock, metrics, run_id):
                     market.connected = {"public"}
                     synthetic(market, store, now + 200, 3)
                     market.disconnect("market")
-                    on_event(now + 200)
+                    on_event(point(now + 200))
                     synthetic(market, store, now + 301, 4)
-                    on_event(now + 301)
+                    on_event(point(now + 301))
 
-                args = argparse.Namespace(command="paper", exercise_quantity=None,
-                                          close_position=True, hold_seconds=10, seconds=1)
-                with patch("apex_flow.collector.run_collector", fake_collector):
+                args = SessionOptions(command="paper", exercise_quantity=None,
+                                          close_position=True, hold_seconds=10, seconds=1,
+                                          metrics_output=str(Path(directory)/"metrics.jsonl"), metrics_interval=30)
+                with patch("apex_flow.runtime.run_collector", fake_collector):
                     await live(config, store, args)
                 self.assertEqual(Decimal(store.get("account")["quantity"]), 0)
             finally:
